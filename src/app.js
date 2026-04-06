@@ -26,8 +26,7 @@ async function bootstrap() {
     await seedDefaultAdmin();
     console.log('🚀 Database ready');
   } catch (err) {
-    console.error('❌ Failed to initialize database:', err);
-    process.exit(1);
+    console.error('❌ Database connection error (verify DATABASE_URL):', err.message);
   }
 }
 

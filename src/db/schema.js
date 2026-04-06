@@ -33,6 +33,9 @@ async function initializeSchema() {
   try {
     await client.query('BEGIN');
     
+    // Ensure UUID support
+    await client.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"');
+    
     // Create users table
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
