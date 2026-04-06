@@ -20,8 +20,18 @@ const recordRoutes    = require('./routes/records');
 const dashboardRoutes = require('./routes/dashboard');
 
 // ── Bootstrap DB ──────────────────────────────────────────────────────────────
-initializeSchema();
-seedDefaultAdmin();
+async function bootstrap() {
+  try {
+    await initializeSchema();
+    await seedDefaultAdmin();
+    console.log('🚀 Database ready');
+  } catch (err) {
+    console.error('❌ Failed to initialize database:', err);
+    process.exit(1);
+  }
+}
+
+bootstrap();
 
 // ── App Setup ─────────────────────────────────────────────────────────────────
 const app = express();

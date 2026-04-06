@@ -1,88 +1,101 @@
 /**
  * Database Schema & Initialization
- * Uses better-sqlite3 for synchronous SQLite access.
- * All tables are created with IF NOT EXISTS so this is idempotent.
+ * Uses pg (PostgreSQL) for cloud-native persistence.
  */
 
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
+const { DATABASE_URL } = require('../config');
 
-// On Vercel, we must use an in-memory database because the filesystem is read-only.
-const isVercel = process.env.VERCEL === '1';
-const connectionString = isVercel ? ':memory:' : DB_PATH;
-
-const db = new Database(connectionString);
-
-// Enable WAL mode for better concurrent read performance
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// Initialize Pool with connection string
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Required for many cloud Postgres like Supabase/Neon
+  }
+});
 
 /**
- * Run all DDL statements to initialize the schema.
- * Safe to call multiple times (idempotent).
+ * Execute a query with parameters
  */
-function initializeSchema() {
-  db.exec(`
-    -- ─────────────────────────────────────────────
-    -- Users table
-    -- ─────────────────────────────────────────────
-    CREATE TABLE IF NOT EXISTS users (
-      id          TEXT PRIMARY KEY,          -- UUID
-      username    TEXT NOT NULL UNIQUE,
-      email       TEXT NOT NULL UNIQUE,
-      password    TEXT NOT NULL,             -- bcrypt hash
-      role        TEXT NOT NULL DEFAULT 'viewer'  -- 'viewer' | 'analyst' | 'admin'
-                  CHECK(role IN ('viewer', 'analyst', 'admin')),
-      status      TEXT NOT NULL DEFAULT 'active'  -- 'active' | 'inactive'
-                  CHECK(status IN ('active', 'inactive')),
-      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    -- ─────────────────────────────────────────────
-    -- Financial records table
-    -- ─────────────────────────────────────────────
-    CREATE TABLE IF NOT EXISTS financial_records (
-      id          TEXT PRIMARY KEY,          -- UUID
-      amount      REAL NOT NULL CHECK(amount > 0),
-      type        TEXT NOT NULL             -- 'income' | 'expense'
-                  CHECK(type IN ('income', 'expense')),
-      category    TEXT NOT NULL,
-      date        TEXT NOT NULL,            -- ISO 8601 date string YYYY-MM-DD
-      notes       TEXT,
-      created_by  TEXT NOT NULL REFERENCES users(id),
-      is_deleted  INTEGER NOT NULL DEFAULT 0,   -- soft delete flag (0=active, 1=deleted)
-      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    -- ─────────────────────────────────────────────
-    -- Indexes for common query patterns
-    -- ─────────────────────────────────────────────
-    CREATE INDEX IF NOT EXISTS idx_records_type     ON financial_records(type)     WHERE is_deleted = 0;
-    CREATE INDEX IF NOT EXISTS idx_records_category ON financial_records(category) WHERE is_deleted = 0;
-    CREATE INDEX IF NOT EXISTS idx_records_date     ON financial_records(date)     WHERE is_deleted = 0;
-    CREATE INDEX IF NOT EXISTS idx_records_created_by ON financial_records(created_by) WHERE is_deleted = 0;
-  `);
-
-  console.log('✅ Database schema initialized');
+async function query(text, params) {
+  const start = Date.now();
+  const res = await pool.query(text, params);
+  const duration = Date.now() - start;
+  // console.log('executed query', { text, duration, rows: res.rowCount });
+  return res;
 }
 
-// Seed a default admin if no users exist yet
-function seedDefaultAdmin() {
-  const bcrypt = require('bcryptjs');
-  const { v4: uuidv4 } = require('uuid');
+/**
+ * Run DDL statements to initialize Postgres schema.
+ */
+async function initializeSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Create users table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id          UUID PRIMARY KEY,
+        username    TEXT NOT NULL UNIQUE,
+        email       TEXT NOT NULL UNIQUE,
+        password    TEXT NOT NULL,
+        role        TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'analyst', 'admin')),
+        status      TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'inactive')),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-  const existing = db.prepare('SELECT id FROM users WHERE role = ?').get('admin');
-  if (!existing) {
-    const hashedPassword = bcrypt.hashSync('Admin@123', 10);
-    db.prepare(`
-      INSERT INTO users (id, username, email, password, role, status)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(uuidv4(), 'admin', 'admin@finance.local', hashedPassword, 'admin', 'active');
-    console.log('🌱 Default admin seeded  →  username: admin  |  password: Admin@123');
+    // Create records table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS financial_records (
+        id          UUID PRIMARY KEY,
+        amount      DECIMAL(15, 2) NOT NULL CHECK(amount > 0),
+        type        TEXT NOT NULL CHECK(type IN ('income', 'expense')),
+        category    TEXT NOT NULL,
+        date        DATE NOT NULL,
+        notes       TEXT,
+        created_by  UUID NOT NULL REFERENCES users(id),
+        is_deleted  BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Create indexes
+    await client.query('CREATE INDEX IF NOT EXISTS idx_records_type     ON financial_records(type)     WHERE is_deleted = FALSE;');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_records_category ON financial_records(category) WHERE is_deleted = FALSE;');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_records_date     ON financial_records(date)     WHERE is_deleted = FALSE;');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_records_created_by ON financial_records(created_by) WHERE is_deleted = FALSE;');
+
+    await client.query('COMMIT');
+    console.log('✅ PostgreSQL database schema initialized');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ Database initialization failed', e);
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
-module.exports = { db, initializeSchema, seedDefaultAdmin };
+/**
+ * Seed a default admin
+ */
+async function seedDefaultAdmin() {
+  const bcrypt = require('bcryptjs');
+  const { v4: uuidv4 } = require('uuid');
+
+  const { rows } = await query('SELECT id FROM users WHERE role = $1', ['admin']);
+  if (rows.length === 0) {
+    const hashedPassword = bcrypt.hashSync('Admin@123', 10);
+    await query(`
+      INSERT INTO users (id, username, email, password, role, status)
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [uuidv4(), 'admin', 'admin@finance.local', hashedPassword, 'admin', 'active']);
+    console.log('🌱 Default admin seeded');
+  }
+}
+
+module.exports = { pool, query, initializeSchema, seedDefaultAdmin };

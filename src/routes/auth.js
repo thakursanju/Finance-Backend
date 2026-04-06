@@ -38,11 +38,11 @@ const { RegisterSchema, LoginSchema } = require('../schemas');
  *       422:
  *         description: Validation error
  */
-router.post('/register', validate(RegisterSchema), (req, res, next) => {
+router.post('/register', validate(RegisterSchema), async (req, res, next) => {
   try {
     // Public registration is always 'viewer'. Admins use POST /users to set roles.
     const { role, ...rest } = req.body;
-    const user = authService.register({ ...rest, role: 'viewer' });
+    const user = await authService.register({ ...rest, role: 'viewer' });
     res.status(201).json({ success: true, data: user });
   } catch (err) {
     next(err);

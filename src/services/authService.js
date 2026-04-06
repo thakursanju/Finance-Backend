@@ -1,44 +1,46 @@
 /**
  * Auth Service
- * Handles user registration, login, and JWT issuance.
+ * Handles user registration, login, and JWT issuance using PostgreSQL.
  */
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
-const { db } = require('../db/schema');
+const { query } = require('../db/schema');
 const { JWT_SECRET, JWT_EXPIRES } = require('../config');
 const { createError } = require('../middleware/errorHandler');
 
 /**
  * Register a new user.
- * Only admins can set roles other than 'viewer' (enforced at the route level).
  */
-function register({ username, email, password, role = 'viewer' }) {
+async function register({ username, email, password, role = 'viewer' }) {
   // Check uniqueness
-  const existingUser = db
-    .prepare('SELECT id FROM users WHERE username = ? OR email = ?')
-    .get(username, email);
-  if (existingUser) {
+  const { rows: existing } = await query(
+    'SELECT id FROM users WHERE username = $1 OR email = $2',
+    [username, email]
+  );
+  if (existing.length > 0) {
     throw createError('Username or email already in use.', 409);
   }
 
   const hashedPassword = bcrypt.hashSync(password, 10);
   const id = uuidv4();
 
-  db.prepare(`
+  await query(`
     INSERT INTO users (id, username, email, password, role, status)
-    VALUES (?, ?, ?, ?, ?, 'active')
-  `).run(id, username, email, hashedPassword, role);
+    VALUES ($1, $2, $3, $4, $5, 'active')
+  `, [id, username, email, hashedPassword, role]);
 
-  return getUserById(id);
+  return await getUserById(id);
 }
 
 /**
  * Authenticate credentials and return a signed JWT.
  */
-function login({ email, password }) {
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+async function login({ email, password }) {
+  const { rows } = await query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = rows[0];
+
   if (!user) throw createError('Invalid credentials.', 401);
   if (user.status === 'inactive') throw createError('Account is inactive.', 403);
 
@@ -59,8 +61,9 @@ function login({ email, password }) {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-function getUserById(id) {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+async function getUserById(id) {
+  const { rows } = await query('SELECT * FROM users WHERE id = $1', [id]);
+  const user = rows[0];
   if (!user) throw createError('User not found.', 404);
   return sanitizeUser(user);
 }

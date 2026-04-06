@@ -11,6 +11,7 @@ const config = {
   NODE_ENV:    process.env.NODE_ENV || 'development',
   JWT_SECRET:  process.env.JWT_SECRET || 'finance-secret-dev-key-change-in-production',
   JWT_EXPIRES: process.env.JWT_EXPIRES || '24h',
+  DATABASE_URL: process.env.DATABASE_URL || '',
 };
 
 if (config.NODE_ENV === 'production' && config.JWT_SECRET.includes('dev')) {

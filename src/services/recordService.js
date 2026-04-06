@@ -1,55 +1,12 @@
 /**
- * Financial Records Service
- * All CRUD operations and filtering for financial records.
- * Soft-delete is used (is_deleted = 1) so historical data is preserved.
+ * Record Service (PostgreSQL version)
  */
 
 const { v4: uuidv4 } = require('uuid');
-const { db } = require('../db/schema');
+const { query } = require('../db/schema');
 const { createError } = require('../middleware/errorHandler');
 
-// ── Core CRUD ─────────────────────────────────────────────────────────────────
-
-/**
- * Create a new financial record.
- */
-function createRecord({ amount, type, category, date, notes }, createdBy) {
-  const id = uuidv4();
-
-  db.prepare(`
-    INSERT INTO financial_records (id, amount, type, category, date, notes, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, amount, type, category.toLowerCase(), date, notes || null, createdBy);
-
-  return getRecordById(id);
-}
-
-/**
- * Get a single record by ID (excluding soft-deleted records).
- */
-function getRecordById(id) {
-  const record = db.prepare(`
-    SELECT * FROM financial_records WHERE id = ? AND is_deleted = 0
-  `).get(id);
-  if (!record) throw createError('Record not found.', 404);
-  return record;
-}
-
-/**
- * List records with optional filters and pagination.
- * @param {{
- *   type?: 'income'|'expense',
- *   category?: string,
- *   fromDate?: string,
- *   toDate?: string,
- *   search?: string,
- *   page?: number,
- *   limit?: number,
- *   sortBy?: string,
- *   order?: 'asc'|'desc'
- * }} filters
- */
-function listRecords({
+async function listRecords({
   type,
   category,
   fromDate,
@@ -59,84 +16,120 @@ function listRecords({
   limit = 20,
   sortBy = 'date',
   order = 'desc',
-} = {}) {
-  const conditions = ['is_deleted = 0'];
+}) {
+  const offset = (page - 1) * limit;
+  let sql = 'SELECT * FROM financial_records WHERE is_deleted = FALSE';
   const params = [];
 
-  if (type)     { conditions.push('type = ?');           params.push(type); }
-  if (category) { conditions.push('category = ?');       params.push(category.toLowerCase()); }
-  if (fromDate) { conditions.push('date >= ?');          params.push(fromDate); }
-  if (toDate)   { conditions.push('date <= ?');          params.push(toDate); }
-  if (search)   {
-    conditions.push('(notes LIKE ? OR category LIKE ?)');
-    params.push(`%${search}%`, `%${search}%`);
+  if (type) {
+    params.push(type);
+    sql += ` AND type = $${params.length}`;
+  }
+  if (category) {
+    params.push(category.toLowerCase());
+    sql += ` AND LOWER(category) = $${params.length}`;
+  }
+  if (fromDate) {
+    params.push(fromDate);
+    sql += ` AND date >= $${params.length}`;
+  }
+  if (toDate) {
+    params.push(toDate);
+    sql += ` AND date <= $${params.length}`;
+  }
+  if (search) {
+    params.push(`%${search.toLowerCase()}%`);
+    sql += ` AND (LOWER(notes) LIKE $${params.length} OR LOWER(category) LIKE $${params.length})`;
   }
 
-  // Whitelist sortable columns to prevent SQL injection
-  const allowedSortColumns = ['date', 'amount', 'category', 'type', 'created_at'];
-  const safeSort  = allowedSortColumns.includes(sortBy) ? sortBy : 'date';
-  const safeOrder = order === 'asc' ? 'ASC' : 'DESC';
+  // Sorting (Sanitize manually since we can't use parameters for column names)
+  const allowedSortFields = ['date', 'amount', 'category', 'type', 'created_at'];
+  const finalSortBy = allowedSortFields.includes(sortBy) ? sortBy : 'date';
+  const finalOrder = order.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
-  const where  = `WHERE ${conditions.join(' AND ')}`;
-  const offset = (page - 1) * limit;
+  sql += ` ORDER BY ${finalSortBy} ${finalOrder} LIMIT ${limit} OFFSET ${offset}`;
 
-  const rows = db.prepare(`
-    SELECT * FROM financial_records ${where}
-    ORDER BY ${safeSort} ${safeOrder}
-    LIMIT ? OFFSET ?
-  `).all(...params, limit, offset);
+  const { rows } = await query(sql, params);
+  
+  // Count total for pagination
+  let countSql = 'SELECT COUNT(*) FROM financial_records WHERE is_deleted = FALSE';
+  const countParams = [];
+  // (Adding same filters to countSql...)
+  if (type) { countParams.push(type); countSql += ` AND type = $${countParams.length}`; }
+  if (category) { countParams.push(category.toLowerCase()); countSql += ` AND LOWER(category) = $${countParams.length}`; }
+  if (fromDate) { countParams.push(fromDate); countSql += ` AND date >= $${countParams.length}`; }
+  if (toDate) { countParams.push(toDate); countSql += ` AND date <= $${countParams.length}`; }
+  if (search) { countParams.push(`%${search.toLowerCase()}%`); countSql += ` AND (LOWER(notes) LIKE $${countParams.length} OR LOWER(category) LIKE $${countParams.length})`; }
 
-  const total = db.prepare(`SELECT COUNT(*) AS count FROM financial_records ${where}`)
-    .get(...params).count;
+  const { rows: countResult } = await query(countSql, countParams);
+  const total = parseInt(countResult[0].count, 10);
 
   return {
     data: rows,
-    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
   };
 }
 
-/**
- * Update mutable fields on a record. Admins only.
- */
-function updateRecord(id, updates) {
-  getRecordById(id); // throws 404 if not found / already deleted
+async function createRecord(data, userId) {
+  const { amount, type, category, date, notes } = data;
+  const id = uuidv4();
 
-  const fields = [];
-  const params = [];
+  const { rows } = await query(`
+    INSERT INTO financial_records (id, amount, type, category, date, notes, created_by)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING *
+  `, [id, amount, type, category.toLowerCase(), date, notes, userId]);
 
-  const allowed = ['amount', 'type', 'category', 'date', 'notes'];
-  for (const key of allowed) {
-    if (updates[key] !== undefined) {
-      fields.push(`${key} = ?`);
-      params.push(key === 'category' ? updates[key].toLowerCase() : updates[key]);
-    }
-  }
-
-  if (fields.length === 0) throw createError('No updatable fields provided.', 400);
-
-  fields.push("updated_at = datetime('now')");
-  params.push(id);
-
-  db.prepare(`
-    UPDATE financial_records SET ${fields.join(', ')} WHERE id = ?
-  `).run(...params);
-
-  return getRecordById(id);
+  return rows[0];
 }
 
-/**
- * Soft-delete a record. Admins only.
- */
-function deleteRecord(id) {
-  getRecordById(id); // throws 404 if not found or already deleted
-
-  db.prepare(`
-    UPDATE financial_records
-    SET is_deleted = 1, updated_at = datetime('now')
-    WHERE id = ?
-  `).run(id);
-
-  return { message: 'Record deleted successfully.' };
+async function getRecordById(id) {
+  const { rows } = await query('SELECT * FROM financial_records WHERE id = $1 AND is_deleted = FALSE', [id]);
+  if (rows.length === 0) throw createError('Record not found.', 404);
+  return rows[0];
 }
 
-module.exports = { createRecord, getRecordById, listRecords, updateRecord, deleteRecord };
+async function updateRecord(id, data) {
+  const { amount, type, category, date, notes } = data;
+  
+  // Dynamic update logic
+  const updates = [];
+  const params = [id];
+  let i = 2;
+
+  if (amount !== undefined) { updates.push(`amount = $${i++}`); params.push(amount); }
+  if (type !== undefined) { updates.push(`type = $${i++}`); params.push(type); }
+  if (category !== undefined) { updates.push(`category = $${i++}`); params.push(category.toLowerCase()); }
+  if (date !== undefined) { updates.push(`date = $${i++}`); params.push(date); }
+  if (notes !== undefined) { updates.push(`notes = $${i++}`); params.push(notes); }
+  
+  updates.push(`updated_at = NOW()`);
+
+  if (updates.length <= 1) return await getRecordById(id);
+
+  const { rows } = await query(`
+    UPDATE financial_records SET ${updates.join(', ')}
+    WHERE id = $1 AND is_deleted = FALSE
+    RETURNING *
+  `, params);
+
+  if (rows.length === 0) throw createError('Record not found.', 404);
+  return rows[0];
+}
+
+async function deleteRecord(id) {
+  const { rowCount } = await query(`
+    UPDATE financial_records SET is_deleted = TRUE, updated_at = NOW()
+    WHERE id = $1 AND is_deleted = FALSE
+  `, [id]);
+
+  if (rowCount === 0) throw createError('Record not found.', 404);
+  return { message: 'Record soft-deleted.' };
+}
+
+module.exports = { listRecords, createRecord, getRecordById, updateRecord, deleteRecord };
